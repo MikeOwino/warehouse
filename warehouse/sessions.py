@@ -14,6 +14,7 @@ import datetime
 import functools
 import time
 
+import markupsafe
 import msgpack
 import msgpack.exceptions
 import redis
@@ -40,7 +41,6 @@ def _invalid_method(method):
 
 @implementer(ISession)
 class InvalidSession(dict):
-
     __contains__ = _invalid_method(dict.__contains__)
     __delitem__ = _invalid_method(dict.__delitem__)
     __getitem__ = _invalid_method(dict.__getitem__)
@@ -170,22 +170,27 @@ class Session(dict):
     def _get_flash_queue_key(self, queue):
         return ".".join(filter(None, [self._flash_key, queue]))
 
-    def flash(self, msg, queue="", allow_duplicate=True):
+    def flash(self, msg, queue="", allow_duplicate=True, safe=False):
         queue_key = self._get_flash_queue_key(queue)
 
         # If we're not allowing duplicates check if this message is already
         # in the queue, and if it is just return immediately.
-        if not allow_duplicate and msg in self[queue_key]:
+        if not allow_duplicate and {"msg": msg, "safe": safe} in self.get(
+            queue_key, []
+        ):
             return
 
-        self.setdefault(queue_key, []).append(msg)
+        self.setdefault(queue_key, []).append({"msg": msg, "safe": safe})
 
     def peek_flash(self, queue=""):
         return self.get(self._get_flash_queue_key(queue), [])
 
     def pop_flash(self, queue=""):
         queue_key = self._get_flash_queue_key(queue)
-        messages = self.get(queue_key, [])
+        messages = [
+            markupsafe.Markup(m["msg"]) if m["safe"] else m["msg"]
+            for m in self.get(queue_key, [])
+        ]
         self.pop(queue_key, None)
         return messages
 
@@ -222,7 +227,6 @@ class Session(dict):
 
 @implementer(ISessionFactory)
 class SessionFactory:
-
     cookie_name = "session_id"
     max_age = 12 * 60 * 60  # 12 hours
 
@@ -234,7 +238,7 @@ class SessionFactory:
         return self._process_request(request)
 
     def _redis_key(self, session_id):
-        return "warehouse/session/data/{}".format(session_id)
+        return f"warehouse/session/data/{session_id}"
 
     def _process_request(self, request):
         # Register a callback with the request so we can save the session once

@@ -10,14 +10,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
 import datetime
 import uuid
 
 import freezegun
+import passlib.exc
 import pretend
 import pytest
-import pytz
 import requests
 
 from webauthn.helpers import bytes_to_base64url
@@ -31,6 +30,7 @@ import warehouse.utils.webauthn as webauthn
 from warehouse.accounts import services
 from warehouse.accounts.interfaces import (
     BurnedRecoveryCode,
+    IEmailBreachedService,
     InvalidRecoveryCode,
     IPasswordBreachedService,
     ITokenService,
@@ -42,25 +42,37 @@ from warehouse.accounts.interfaces import (
     TooManyEmailsAdded,
     TooManyFailedLogins,
 )
-from warehouse.accounts.models import DisableReason, ProhibitedUserName
+from warehouse.accounts.models import (
+    DisableReason,
+    ProhibitedUserName,
+    TermsOfServiceEngagement,
+    UserTermsOfServiceEngagement,
+)
+from warehouse.events.tags import EventTag
 from warehouse.metrics import IMetricsService, NullMetrics
 from warehouse.rate_limiting.interfaces import IRateLimiter
 
-from ...common.db.accounts import EmailFactory, UserFactory
+from ...common.constants import REMOTE_ADDR
+from ...common.db.accounts import (
+    EmailFactory,
+    UserFactory,
+    UserTermsOfServiceEngagementFactory,
+)
+from ...common.db.ip_addresses import IpAddressFactory
 
 
 class TestDatabaseUserService:
     def test_verify_service(self):
         assert verifyClass(IUserService, services.DatabaseUserService)
 
-    def test_service_creation(self, monkeypatch, remote_addr):
+    def test_service_creation(self, monkeypatch):
         crypt_context_obj = pretend.stub()
         crypt_context_cls = pretend.call_recorder(lambda **kwargs: crypt_context_obj)
         monkeypatch.setattr(services, "CryptContext", crypt_context_cls)
 
         session = pretend.stub()
         service = services.DatabaseUserService(
-            session, metrics=NullMetrics(), remote_addr=remote_addr
+            session, metrics=NullMetrics(), remote_addr=REMOTE_ADDR
         )
 
         assert service.db is session
@@ -82,7 +94,7 @@ class TestDatabaseUserService:
             )
         ]
 
-    def test_service_creation_ratelimiters(self, monkeypatch, remote_addr):
+    def test_service_creation_ratelimiters(self, monkeypatch):
         crypt_context_obj = pretend.stub()
         crypt_context_cls = pretend.call_recorder(lambda **kwargs: crypt_context_obj)
         monkeypatch.setattr(services, "CryptContext", crypt_context_cls)
@@ -93,7 +105,7 @@ class TestDatabaseUserService:
         service = services.DatabaseUserService(
             session,
             metrics=NullMetrics(),
-            remote_addr=remote_addr,
+            remote_addr=REMOTE_ADDR,
             ratelimiters=ratelimiters,
         )
 
@@ -117,7 +129,7 @@ class TestDatabaseUserService:
             )
         ]
 
-    def test_skips_ip_rate_limiter(self, user_service, metrics, remote_addr):
+    def test_skips_ip_rate_limiter(self, user_service, metrics):
         user = UserFactory.create()
         resets = pretend.stub()
         limiter = pretend.stub(
@@ -212,7 +224,7 @@ class TestDatabaseUserService:
             ),
         ]
 
-    def test_check_password_ip_rate_limited(self, user_service, metrics, remote_addr):
+    def test_check_password_ip_rate_limited(self, user_service, metrics):
         user = UserFactory.create()
         resets = pretend.stub()
         limiter = pretend.stub(
@@ -225,8 +237,8 @@ class TestDatabaseUserService:
             user_service.check_password(user.id, None)
 
         assert excinfo.value.resets_in is resets
-        assert limiter.test.calls == [pretend.call(remote_addr)]
-        assert limiter.resets_in.calls == [pretend.call(remote_addr)]
+        assert limiter.test.calls == [pretend.call(REMOTE_ADDR)]
+        assert limiter.resets_in.calls == [pretend.call(REMOTE_ADDR)]
         assert metrics.increment.calls == [
             pretend.call(
                 "warehouse.authentication.start", tags=["mechanism:check_password"]
@@ -240,7 +252,7 @@ class TestDatabaseUserService:
     def test_check_password_invalid(self, user_service, metrics):
         user = UserFactory.create()
         user_service.hasher = pretend.stub(
-            verify_and_update=pretend.call_recorder(lambda l, r: (False, None))
+            verify_and_update=pretend.call_recorder(lambda L, r: (False, None))
         )
 
         assert not user_service.check_password(user.id, "user password")
@@ -257,10 +269,34 @@ class TestDatabaseUserService:
             ),
         ]
 
+    def test_check_password_catches_bcrypt_exception(self, user_service, metrics):
+        user = UserFactory.create()
+
+        @pretend.call_recorder
+        def raiser(*a, **kw):
+            raise passlib.exc.PasswordValueError
+
+        user_service.hasher = pretend.stub(verify_and_update=raiser)
+
+        assert not user_service.check_password(user.id, "user password")
+        assert user_service.hasher.verify_and_update.calls == [
+            pretend.call("user password", user.password)
+        ]
+        assert metrics.increment.calls == [
+            pretend.call(
+                "warehouse.authentication.start", tags=["mechanism:check_password"]
+            ),
+            pretend.call(
+                "warehouse.authentication.failure",
+                tags=["mechanism:check_password", "failure_reason:password"],
+            ),
+        ]
+        assert raiser.calls == [pretend.call("user password", "!")]
+
     def test_check_password_valid(self, user_service, metrics):
         user = UserFactory.create()
         user_service.hasher = pretend.stub(
-            verify_and_update=pretend.call_recorder(lambda l, r: (True, None))
+            verify_and_update=pretend.call_recorder(lambda L, r: (True, None))
         )
 
         assert user_service.check_password(user.id, "user password", tags=["bar"])
@@ -277,11 +313,37 @@ class TestDatabaseUserService:
             ),
         ]
 
-    def test_check_password_updates(self, user_service):
+    @pytest.mark.parametrize(
+        "password",
+        [
+            (
+                "$argon2id$v=19$m=8,t=1,p=1$"
+                "w/gfo5QSQihFyHlvDcE4pw$Hd4KENg+xDlq2bfeGUEYSieIXXL/c1NfTr0ZkYueO2Y"
+            ),
+            (
+                "$bcrypt-sha256$v=2,t=2b,r=12$"
+                "DqC0lms6x9Dh6XesvIJvVe$hBbYe9JfdjyorOFcS3rv5BhmuSIyXD6"
+            ),
+            "$2b$12$2t/EVU3H9b3c5iR6GdELZOwCoyrT518DgCpNxHbX.S1IxV6eEEDhC",
+            "bcrypt$$2b$12$EhhZDxGr/7HIKYRGMngC.O4sQx68vkaISSnSGZ6s8iOfaGy6l9cma",
+        ],
+    )
+    def test_check_password_updates(self, user_service, password):
+        """
+        This test confirms passlib is actually working,
+        see https://github.com/pypi/warehouse/issues/15454
+        """
+        user = UserFactory.create(password=password)
+
+        assert user_service.check_password(user.id, "password")
+        assert user.password.startswith("$argon2id$v=19$m=1024,t=6,p=6$")
+        assert user_service.check_password(user.id, "password")
+
+    def test_hash_is_upgraded(self, user_service):
         user = UserFactory.create()
         password = user.password
         user_service.hasher = pretend.stub(
-            verify_and_update=pretend.call_recorder(lambda l, r: (True, "new password"))
+            verify_and_update=pretend.call_recorder(lambda L, r: (True, "new password"))
         )
 
         assert user_service.check_password(user.id, "user password")
@@ -330,7 +392,7 @@ class TestDatabaseUserService:
         assert not new_email2.primary
         assert not new_email2.verified
 
-    def test_add_email_rate_limited(self, user_service, metrics, remote_addr):
+    def test_add_email_rate_limited(self, user_service, metrics):
         resets = pretend.stub()
         limiter = pretend.stub(
             hit=pretend.call_recorder(lambda ip: None),
@@ -345,13 +407,31 @@ class TestDatabaseUserService:
             user_service.add_email(user.id, user.email)
 
         assert excinfo.value.resets_in is resets
-        assert limiter.test.calls == [pretend.call(remote_addr)]
-        assert limiter.resets_in.calls == [pretend.call(remote_addr)]
+        assert limiter.test.calls == [pretend.call(REMOTE_ADDR)]
+        assert limiter.resets_in.calls == [pretend.call(REMOTE_ADDR)]
         assert metrics.increment.calls == [
             pretend.call(
                 "warehouse.email.add.ratelimited", tags=["ratelimiter:email.add"]
             )
         ]
+
+    def test_add_email_bypass_ratelimit(self, user_service, metrics):
+        resets = pretend.stub()
+        limiter = pretend.stub(
+            hit=pretend.call_recorder(lambda ip: None),
+            test=pretend.call_recorder(lambda ip: False),
+            resets_in=pretend.call_recorder(lambda ip: resets),
+        )
+        user_service.ratelimiters["email.add"] = limiter
+
+        user = UserFactory.create()
+        new_email = user_service.add_email(user.id, "foo@example.com", ratelimit=False)
+
+        assert new_email.email == "foo@example.com"
+        assert not new_email.verified
+        assert limiter.test.calls == []
+        assert limiter.resets_in.calls == []
+        assert metrics.increment.calls == []
 
     def test_update_user(self, user_service):
         user = UserFactory.create()
@@ -416,40 +496,73 @@ class TestDatabaseUserService:
 
         assert user.id == found_user.id
 
+    def test_get_users_by_prefix(self, user_service):
+        user = UserFactory.create()
+        found_users = user_service.get_users_by_prefix(user.username[:3])
+
+        assert len(found_users) == 1
+        assert user.id == found_users[0].id
+
     def test_get_user_by_email_failure(self, user_service):
         found_user = user_service.get_user_by_email("example@email.com")
         user_service.db.flush()
 
         assert found_user is None
 
-    def test_get_admins(self, user_service):
-        admin = UserFactory.create(is_superuser=True)
-        user = UserFactory.create(is_superuser=False)
-        admins = user_service.get_admins()
+    def test_get_admin_user(self, user_service):
+        admin = UserFactory.create(is_superuser=True, username="admin")
 
-        assert admin in admins
-        assert user not in admins
+        assert user_service.get_admin_user() == admin
 
-    def test_disable_password(self, user_service):
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [
+            (None, None),
+            (
+                DisableReason.CompromisedPassword,
+                DisableReason.CompromisedPassword.value,
+            ),
+        ],
+    )
+    def test_disable_password(self, user_service, reason, expected):
+        request = pretend.stub(
+            remote_addr="127.0.0.1",
+            ip_address=IpAddressFactory.create(),
+        )
         user = UserFactory.create()
+        user.record_event = pretend.call_recorder(lambda *a, **kw: None)
 
         # Need to give the user a good password first.
         user_service.update_user(user.id, password="foo")
         assert user.password != "!"
 
         # Now we'll actually test our disable function.
-        user_service.disable_password(user.id)
+        user_service.disable_password(user.id, reason=reason, request=request)
         assert user.password == "!"
+
+        assert user.record_event.calls == [
+            pretend.call(
+                tag=EventTag.Account.PasswordDisabled,
+                request=request,
+                additional={"reason": expected},
+            )
+        ]
 
     @pytest.mark.parametrize(
         ("disabled", "reason"),
         [(True, None), (True, DisableReason.CompromisedPassword), (False, None)],
     )
     def test_is_disabled(self, user_service, disabled, reason):
+        request = pretend.stub(
+            remote_addr="127.0.0.1",
+            ip_address=IpAddressFactory.create(),
+            headers=dict(),
+            db=pretend.stub(add=lambda *a: None),
+        )
         user = UserFactory.create()
         user_service.update_user(user.id, password="foo")
         if disabled:
-            user_service.disable_password(user.id, reason=reason)
+            user_service.disable_password(user.id, reason=reason, request=request)
         assert user_service.is_disabled(user.id) == (disabled, reason)
 
     def test_is_disabled_user_frozen(self, user_service):
@@ -457,8 +570,16 @@ class TestDatabaseUserService:
         assert user_service.is_disabled(user.id) == (True, DisableReason.AccountFrozen)
 
     def test_updating_password_undisables(self, user_service):
+        request = pretend.stub(
+            remote_addr="127.0.0.1",
+            ip_address=IpAddressFactory.create(),
+            headers=dict(),
+            db=pretend.stub(add=lambda *a: None),
+        )
         user = UserFactory.create()
-        user_service.disable_password(user.id, reason=DisableReason.CompromisedPassword)
+        user_service.disable_password(
+            user.id, reason=DisableReason.CompromisedPassword, request=request
+        )
         assert user_service.is_disabled(user.id) == (
             True,
             DisableReason.CompromisedPassword,
@@ -467,14 +588,14 @@ class TestDatabaseUserService:
         assert user_service.is_disabled(user.id) == (False, None)
 
     def test_has_two_factor(self, user_service):
-        user = UserFactory.create()
+        user = UserFactory.create(totp_secret=None)
         assert not user_service.has_two_factor(user.id)
 
         user_service.update_user(user.id, totp_secret=b"foobar")
         assert user_service.has_two_factor(user.id)
 
     def test_has_totp(self, user_service):
-        user = UserFactory.create()
+        user = UserFactory.create(totp_secret=None)
         assert not user_service.has_totp(user.id)
         user_service.update_user(user.id, totp_secret=b"foobar")
         assert user_service.has_totp(user.id)
@@ -500,7 +621,7 @@ class TestDatabaseUserService:
 
     @pytest.mark.parametrize(
         ("last_totp_value", "valid"),
-        ([None, True], ["000000", True], ["000000", False]),
+        [(None, True), ("000000", True), ("000000", False)],
     )
     def test_check_totp_value(self, user_service, monkeypatch, last_totp_value, valid):
         verify_totp = pretend.call_recorder(lambda *a: valid)
@@ -524,7 +645,8 @@ class TestDatabaseUserService:
 
     def test_check_totp_value_no_secret(self, user_service):
         user = UserFactory.create()
-        assert not user_service.check_totp_value(user.id, b"123456")
+        with pytest.raises(otp.InvalidTOTPError):
+            user_service.check_totp_value(user.id, b"123456")
 
     def test_check_totp_global_rate_limited(self, user_service, metrics):
         resets = pretend.stub()
@@ -573,7 +695,7 @@ class TestDatabaseUserService:
         ]
 
     def test_check_totp_value_invalid_secret(self, user_service):
-        user = UserFactory.create()
+        user = UserFactory.create(totp_secret=None)
         limiter = pretend.stub(
             hit=pretend.call_recorder(lambda *a, **kw: None), test=lambda *a, **kw: True
         )
@@ -694,6 +816,8 @@ class TestDatabaseUserService:
             credential_type=PublicKeyCredentialType.PUBLIC_KEY,
             user_verified=False,
             attestation_object=b"foobar",
+            credential_device_type="single_device",
+            credential_backed_up=False,
         )
         verify_registration_response = pretend.call_recorder(
             lambda *a, **kw: fake_validated_credential
@@ -921,7 +1045,7 @@ class TestDatabaseUserService:
         assert [c.id for c in initial_codes] != [c.id for c in new_codes]
 
     def test_get_password_timestamp(self, user_service):
-        create_time = datetime.datetime.utcnow()
+        create_time = datetime.datetime.now(datetime.UTC)
         with freezegun.freeze_time(create_time):
             user = UserFactory.create()
             user.password_date = create_time
@@ -933,6 +1057,88 @@ class TestDatabaseUserService:
         user.password_date = None
 
         assert user_service.get_password_timestamp(user.id) == 0
+
+    def test_needs_tos_flash_no_engagements(self, user_service):
+        user = UserFactory.create()
+        assert user_service.needs_tos_flash(user.id, "initial") is True
+
+    def test_needs_tos_flash_with_passive_engagements(self, user_service):
+        user = UserFactory.create()
+        assert user_service.needs_tos_flash(user.id, "initial") is True
+
+        user_service.record_tos_engagement(
+            user.id, "initial", TermsOfServiceEngagement.Notified
+        )
+        assert user_service.needs_tos_flash(user.id, "initial") is True
+
+        user_service.record_tos_engagement(
+            user.id, "initial", TermsOfServiceEngagement.Flashed
+        )
+        assert user_service.needs_tos_flash(user.id, "initial") is True
+
+    def test_needs_tos_flash_with_viewed_engagement(self, user_service):
+        user = UserFactory.create()
+        assert user_service.needs_tos_flash(user.id, "initial") is True
+
+        user_service.record_tos_engagement(
+            user.id, "initial", TermsOfServiceEngagement.Viewed
+        )
+        assert user_service.needs_tos_flash(user.id, "initial") is False
+
+    def test_needs_tos_flash_with_agreed_engagement(self, user_service):
+        user = UserFactory.create()
+        assert user_service.needs_tos_flash(user.id, "initial") is True
+
+        user_service.record_tos_engagement(
+            user.id, "initial", TermsOfServiceEngagement.Agreed
+        )
+        assert user_service.needs_tos_flash(user.id, "initial") is False
+
+    def test_needs_tos_flash_if_engaged_more_than_30_days_ago(self, user_service):
+        user = UserFactory.create()
+        UserTermsOfServiceEngagementFactory.create(
+            user=user,
+            created=(datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=31)),
+            engagement=TermsOfServiceEngagement.Notified,
+        )
+        assert user_service.needs_tos_flash(user.id, "initial") is False
+
+    def test_record_tos_engagement_invalid_engagement(self, user_service):
+        user = UserFactory.create()
+        assert user.terms_of_service_engagements == []
+        with pytest.raises(ValueError):  # noqa: PT011
+            user_service.record_tos_engagement(
+                user.id,
+                "initial",
+                None,
+            )
+
+    @pytest.mark.parametrize(
+        "engagement",
+        [
+            TermsOfServiceEngagement.Flashed,
+            TermsOfServiceEngagement.Notified,
+            TermsOfServiceEngagement.Viewed,
+            TermsOfServiceEngagement.Agreed,
+        ],
+    )
+    def test_record_tos_engagement(self, user_service, db_request, engagement):
+        user = UserFactory.create()
+        assert user.terms_of_service_engagements == []
+        user_service.record_tos_engagement(
+            user.id,
+            "initial",
+            engagement,
+        )
+        assert (
+            db_request.db.query(UserTermsOfServiceEngagement)
+            .filter(
+                UserTermsOfServiceEngagement.user_id == user.id,
+                UserTermsOfServiceEngagement.revision == "initial",
+                UserTermsOfServiceEngagement.engagement == engagement,
+            )
+            .count()
+        ) == 1
 
 
 class TestTokenService:
@@ -960,7 +1166,7 @@ class TestTokenService:
         assert token_service.loads(token) == {"foo": "bar"}
 
     def test_loads_return_timestamp(self, token_service):
-        sign_time = pytz.UTC.localize(datetime.datetime.utcnow())
+        sign_time = datetime.datetime.now(datetime.UTC)
         with freezegun.freeze_time(sign_time):
             token = token_service.dumps({"foo": "bar"})
 
@@ -975,7 +1181,7 @@ class TestTokenService:
             token_service.loads(token)
 
     def test_loads_token_is_expired(self, token_service):
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC)
 
         with freezegun.freeze_time(now) as frozen_time:
             token = token_service.dumps({"foo": "bar"})
@@ -991,8 +1197,30 @@ class TestTokenService:
         with pytest.raises(TokenInvalid):
             token_service.loads("invalid")
 
+    def test_unsafe_load_payload(self, token_service):
+        sign_time = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)
+        with freezegun.freeze_time(sign_time):
+            token = token_service.dumps({"foo": "bar"})
 
-def test_database_login_factory(monkeypatch, pyramid_services, metrics, remote_addr):
+        with pytest.raises(TokenExpired):
+            token_service.loads(token)
+
+        assert token_service.unsafe_load_payload(token) == {"foo": "bar"}
+
+    def test_unsafe_load_payload_signature_invalid(self, token_service):
+        sign_time = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=10)
+        with freezegun.freeze_time(sign_time):
+            token = services.TokenService("wrongsecret", "pepper", max_age=3600).dumps(
+                {"foo": "bar"}
+            )
+
+        with pytest.raises(TokenInvalid):
+            token_service.loads(token)
+
+        assert token_service.unsafe_load_payload(token) is None
+
+
+def test_database_login_factory(monkeypatch, pyramid_services, metrics):
     service_obj = pretend.stub()
     service_cls = pretend.call_recorder(lambda *a, **kw: service_obj)
     monkeypatch.setattr(services, "DatabaseUserService", service_cls)
@@ -1029,7 +1257,7 @@ def test_database_login_factory(monkeypatch, pyramid_services, metrics, remote_a
 
     context = pretend.stub()
     request = pretend.stub(
-        db=pretend.stub(), find_service=find_service, remote_addr=remote_addr
+        db=pretend.stub(), find_service=find_service, remote_addr=REMOTE_ADDR
     )
 
     assert services.database_login_factory(context, request) is service_obj
@@ -1037,7 +1265,7 @@ def test_database_login_factory(monkeypatch, pyramid_services, metrics, remote_a
         pretend.call(
             request.db,
             metrics=metrics,
-            remote_addr=remote_addr,
+            remote_addr=REMOTE_ADDR,
             ratelimiters={
                 "global.login": global_login_ratelimiter,
                 "user.login": user_login_ratelimiter,
@@ -1191,16 +1419,7 @@ class TestHaveIBeenPwnedPasswordBreachedService:
         assert not svc.check_password("my password")
         assert raiser.calls
 
-    def test_metrics_increments(self):
-        class Metrics:
-            def __init__(self):
-                self.values = collections.Counter()
-
-            def increment(self, metric):
-                self.values[metric] += 1
-
-        metrics = Metrics()
-
+    def test_metrics_increments(self, metrics):
         svc = services.HaveIBeenPwnedPasswordBreachedService(
             session=pretend.stub(), metrics=metrics
         )
@@ -1209,7 +1428,11 @@ class TestHaveIBeenPwnedPasswordBreachedService:
         svc._metrics_increment("another_thing")
         svc._metrics_increment("something")
 
-        assert metrics.values == {"something": 2, "another_thing": 1}
+        assert metrics.increment.calls == [
+            pretend.call("something"),
+            pretend.call("another_thing"),
+            pretend.call("something"),
+        ]
 
     def test_factory(self):
         context = pretend.stub()
@@ -1315,3 +1538,100 @@ class TestNullPasswordBreachedService:
 
         assert isinstance(svc, services.NullPasswordBreachedService)
         assert not svc.check_password("hunter2")
+
+
+class TestHaveIBeenPwnedEmailBreachedService:
+    def test_verify_service(self):
+        assert verifyClass(
+            IEmailBreachedService, services.HaveIBeenPwnedEmailBreachedService
+        )
+
+    def test_no_api_key(self):
+        svc = services.HaveIBeenPwnedEmailBreachedService(session=pretend.stub())
+        assert svc.get_email_breach_count("anything") is None
+
+    def test_successful_breach_count(self):
+        response = pretend.stub(
+            json=lambda: [{"LinkedIn"}], raise_for_status=lambda: None
+        )
+        session = pretend.stub(get=pretend.call_recorder(lambda *a, **kw: response))
+        svc = services.HaveIBeenPwnedEmailBreachedService(
+            session=session, api_key="blowhole"
+        )
+
+        assert svc.get_email_breach_count("foo@example.com") == 1
+        assert session.get.calls == [
+            pretend.call(
+                "https://haveibeenpwned.com/api/v3/breachedaccount/foo@example.com",
+                headers={"User-Agent": "PyPI.org", "hibp-api-key": "blowhole"},
+                timeout=(0.25, 0.25),
+            )
+        ]
+
+    def test_no_breaches(self):
+        class NotFoundException(requests.HTTPError):
+            def __init__(self):
+                self.response = pretend.stub(status_code=404)
+
+        response = pretend.stub(raise_for_status=pretend.raiser(NotFoundException))
+        session = pretend.stub(
+            get=pretend.call_recorder(lambda *a, **kw: response),
+        )
+        svc = services.HaveIBeenPwnedEmailBreachedService(
+            session=session, api_key="blowhole"
+        )
+
+        assert svc.get_email_breach_count("new-email@gmail.com") == 0
+        assert session.get.calls == [
+            pretend.call(
+                "https://haveibeenpwned.com/api/v3/breachedaccount/new-email@gmail.com",
+                headers={"User-Agent": "PyPI.org", "hibp-api-key": "blowhole"},
+                timeout=(0.25, 0.25),
+            )
+        ]
+
+    def test_other_failure(self):
+        class OtherHTTPException(requests.HTTPError):
+            def __init__(self):
+                self.response = pretend.stub(status_code=401)
+
+        response = pretend.stub(raise_for_status=pretend.raiser(OtherHTTPException))
+        session = pretend.stub(
+            get=pretend.call_recorder(lambda *a, **kw: response),
+        )
+        svc = services.HaveIBeenPwnedEmailBreachedService(
+            session=session, api_key="blowhole"
+        )
+
+        assert svc.get_email_breach_count("invalid-address") == -1
+
+    def test_factory(self):
+        context = pretend.stub()
+        hibp_api_key = "blowhole"
+        request = pretend.stub(
+            http=pretend.stub(),
+            registry=pretend.stub(settings={"hibp.api_key": hibp_api_key}),
+        )
+        svc = services.HaveIBeenPwnedEmailBreachedService.create_service(
+            context, request
+        )
+
+        assert svc._http is request.http
+        assert svc.api_key == hibp_api_key
+
+
+class TestNullEmailBreachedService:
+    def test_verify_service(self):
+        assert verifyClass(IEmailBreachedService, services.NullEmailBreachedService)
+
+    def test_check_email(self):
+        svc = services.NullEmailBreachedService()
+        assert svc.get_email_breach_count("foo@example.com") == 0
+
+    def test_factory(self):
+        context = pretend.stub()
+        request = pretend.stub()
+        svc = services.NullEmailBreachedService.create_service(context, request)
+
+        assert isinstance(svc, services.NullEmailBreachedService)
+        assert svc.get_email_breach_count("foo@example.com") == 0
